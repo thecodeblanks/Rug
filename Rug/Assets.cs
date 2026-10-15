@@ -2,9 +2,12 @@ using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Security.Cryptography;
+using System.Text;
 
 namespace Rug;
 
@@ -16,6 +19,7 @@ internal static class Assets
     public static string UserFloorDir => Path.Combine(AppSettings.DataDir, "floors");
 
     private static string CacheDir => Path.Combine(AppSettings.DataDir, "assets");
+    private static string ThumbnailDir => Path.Combine(AppSettings.DataDir, "thumbnails");
 
     public static List<string> BuiltinRugs() => Bundled("rugs");
 
@@ -79,8 +83,26 @@ internal static class Assets
         };
     }
 
-    public static Bitmap Thumbnail(string path, int width = 100, int height = 68)
+    // Decoding a 5000 px picture takes about 120 ms (measured 2026-10-14), so each thumbnail is kept as a
+    // lossless PNG; a cached one has the same pixels as a fresh one. The name changes when the picture changes.
+    // fresh is true when the picture was decoded now and the result belongs in the cache.
+    public static Bitmap Thumbnail(string path, out bool fresh, int width = 100, int height = 68)
     {
+        fresh = false;
+        string? cached = ThumbnailCachePath(path, width, height);
+        if (cached != null && File.Exists(cached))
+        {
+            try
+            {
+                using var stored = new Bitmap(cached);
+                return new Bitmap(stored);
+            }
+            catch (Exception)
+            {
+                // A damaged cache file is decoded again and overwritten.
+            }
+        }
+
         var bmp = new Bitmap(width, height);
         try
         {
@@ -94,8 +116,43 @@ internal static class Assets
         }
         catch (Exception)
         {
-
+            return bmp;
         }
+        fresh = cached != null;
         return bmp;
     }
+
+    // Written straight under its final name. On 2026-10-14 Trend Micro's ransomware protection stopped Rug
+    // when it wrote a randomly named .tmp file and renamed it over the .png, the way ransomware replaces a file.
+    public static void StoreThumbnail(string path, Bitmap bmp, int width = 100, int height = 68)
+    {
+        string? target = ThumbnailCachePath(path, width, height);
+        if (target == null) return;
+        try
+        {
+            Directory.CreateDirectory(ThumbnailDir);
+            bmp.Save(target, ImageFormat.Png);
+        }
+        catch (Exception)
+        {
+            // Without the cache the next start decodes the picture again.
+        }
+    }
+
+    private static string? ThumbnailCachePath(string path, int width, int height)
+    {
+        try
+        {
+            var info = new FileInfo(path);
+            if (!info.Exists) return null;
+            string key = $"{info.FullName}|{info.Length}|{info.LastWriteTimeUtc.Ticks}|{width}x{height}";
+            string name = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(key)), 0, 16) + ".png";
+            return Path.Combine(ThumbnailDir, name);
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
+
 }

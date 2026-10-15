@@ -4,16 +4,23 @@
 #include "cloth.h"
 
 #include <d3d11.h>
-#include <d3dcompiler.h>
 #include <objbase.h>
 #include <wincodec.h>
 
 #include <algorithm>
 #include <cmath>
-#include <cstdio>
 #include <cstring>
 #include <memory>
+#include <new>
 #include <vector>
+
+// Shader bytecode compiled at build time by FxCompile from shaders\*.hlsl.
+#include "cloth_ps.h"
+#include "cloth_vs.h"
+#include "floor_ps.h"
+#include "floor_vs.h"
+#include "shadow_ps.h"
+#include "shadow_vs.h"
 
 namespace {
 
@@ -22,6 +29,18 @@ constexpr float kClickLift = 100.0f;
 constexpr float kLiftRamp = 0.3f;
 constexpr int   kColumns = 44;
 constexpr bool  kDesktopShadow = false;
+
+// A cloth resting on icon bumps never reaches an exact fixed point: it keeps trembling around a mean pose
+// without drifting, by up to 0.07 px after a drop at the screen centre (measured 2026-10-14 on 26 desktop
+// icons). A threshold on raw movement either never fires on that tremble or freezes a cloth that is still
+// creeping, so the cloth sleeps once the mean pose of a kSleepWindow-step window is less than kSleepDrift
+// from the window before it. Measured on eight drops: asleep after 8-28 s, each pose inside the original's tremble.
+constexpr int   kSleepWindow = 120;
+constexpr float kSleepDrift = 0.005f;
+// A corner balanced on a bump edge can creep for good: its window mean never settles below kSleepDrift. A drop
+// that is going to settle does so within 8-28 s (measured on eight drops), i.e. well under kStuckWindows windows,
+// so only a truly stuck cloth reaches this cap and is frozen at its mean to stop the tremble and let it sleep.
+constexpr int   kStuckWindows = 20;
 
 struct Vtx { float pos[3]; float nrm[3]; float uv[2]; };
 struct Cb {
@@ -34,161 +53,6 @@ struct Cb {
     float floorZ;
     float pad[3];
 };
-
-const char* kShader = R"HLSL(
-cbuffer Cb : register(b0)
-{
-    float4 lightDir;
-    float2 viewSize;
-    float2 rugSize;
-    float2 lightK;
-    float  camD;
-    float  shadowStrength;
-    float  floorZ;
-    float3 _pad;
-};
-
-Texture2D    rugTex    : register(t0);
-Texture2D    shadowMap : register(t1);
-SamplerState rugSamp   : register(s0);
-SamplerState pointSamp : register(s1);
-
-static const float2 poisson[16] = {
-    float2(-0.94201624, -0.39906216), float2(0.94558609, -0.76890725),
-    float2(-0.09418410, -0.92938870), float2(0.34495938, 0.29387760),
-    float2(-0.91588581, 0.45771432),  float2(-0.81544232, -0.87912464),
-    float2(-0.38277543, 0.27676845),  float2(0.97484398, 0.75648379),
-    float2(0.44323325, -0.97511554),  float2(0.53742981, -0.47373420),
-    float2(-0.26496911, -0.41893023), float2(0.79197514, 0.19090188),
-    float2(-0.24188840, 0.99706507),  float2(-0.81409955, 0.91437590),
-    float2(0.19984126, 0.78641367),   float2(0.14383161, -0.14100790)
-};
-
-float depthFromZ(float z) { return saturate(0.5 - z / 4000.0); }
-
-float2 toTC(float2 f) { return float2(f.x / viewSize.x, 1.0 - f.y / viewSize.y); }
-
-float ign(float2 px) { return frac(52.9829189 * frac(dot(px, float2(0.06711056, 0.00583715)))); }
-
-float shadowAt(float3 p, float2 gp, float bias, float2 px)
-{
-    float2 f = p.xy - lightK * p.z;
-    float a = ign(px) * 6.2831853;
-    float2x2 R = float2x2(cos(a), -sin(a), sin(a), cos(a));
-
-    float sumD = 0.0, nB = 0.0;
-    [unroll] for (int i = 0; i < 16; i++)
-    {
-        float2 o = mul(R, poisson[i]) * 34.0;
-        float zr = p.z + dot(gp, o);
-        float occ = shadowMap.SampleLevel(pointSamp, toTC(f + o), 0).r;
-        if (occ > zr + bias) { sumD += occ - zr; nB += 1.0; }
-    }
-    if (nB < 0.5) return 0.0;
-
-    float r = clamp(2.5 + (sumD / nB) * 0.2, 2.5, 30.0);
-    float sh = 0.0;
-    [unroll] for (int j = 0; j < 16; j++)
-    {
-        float2 o = mul(R, poisson[j]) * r;
-        float zr = p.z + dot(gp, o);
-        float occ = shadowMap.SampleLevel(pointSamp, toTC(f + o), 0).r;
-        sh += (occ > zr + bias) ? 1.0 : 0.0;
-    }
-    return sh / 16.0;
-}
-
-struct SIn  { float3 pos : POSITION; };
-struct SOut { float4 sv : SV_POSITION; float z : TEXCOORD0; };
-
-SOut ShadowVS(SIn i)
-{
-    float2 f = i.pos.xy - lightK * i.pos.z;
-    float2 c = viewSize * 0.5;
-    SOut o;
-    o.sv = float4((f - c) / c, depthFromZ(i.pos.z), 1.0);
-    o.z = i.pos.z;
-    return o;
-}
-
-float ShadowPS(SOut i) : SV_TARGET { return i.z; }
-
-float4 FloorVS(uint id : SV_VertexID) : SV_POSITION
-{
-    float x = (id == 1) ? 3.0 : -1.0;
-    float y = (id == 2) ? 3.0 : -1.0;
-    return float4(x, y, 0.0, 1.0);
-}
-
-float4 FloorPS(float4 sp : SV_POSITION) : SV_TARGET
-{
-    float2 xy = float2(sp.x, viewSize.y - sp.y);
-    float s = shadowAt(float3(xy, floorZ), float2(0.0, 0.0), 0.5, sp.xy);
-    float a = s * shadowStrength;
-    return float4(float3(0.035, 0.02, 0.01) * a, a);
-}
-
-struct VIn  { float3 pos : POSITION; float3 nrm : NORMAL; float2 uv : TEXCOORD0; };
-struct VOut { float4 sv : SV_POSITION; float3 world : TEXCOORD1; float3 nrm : NORMAL; float2 uv : TEXCOORD0; };
-
-VOut VSMain(VIn i)
-{
-    float2 c = viewSize * 0.5;
-    float w = (camD - i.pos.z) / camD;
-    VOut o;
-    o.sv    = float4((i.pos.xy - c) / c, depthFromZ(i.pos.z) * w, w);
-    o.world = i.pos;
-    o.nrm   = i.nrm;
-    o.uv    = i.uv;
-    return o;
-}
-
-float4 PSMain(VOut i, bool front : SV_IsFrontFace, float4 sp : SV_POSITION) : SV_TARGET
-{
-    float3 Ng = normalize(i.nrm);
-    float3 N  = front ? Ng : -Ng;
-    float3 col = rugTex.Sample(rugSamp, i.uv).rgb;
-
-    float h = dot(col, float3(0.299, 0.587, 0.114));
-    float2 g = float2(ddx(h), -ddy(h)) * (front ? 1.6 : 0.6);
-    float3 Nd = normalize(N - float3(g, 0.0));
-
-    if (!front)
-    {
-        float gray = dot(col, float3(0.299, 0.587, 0.114));
-        col = lerp(col, float3(gray, gray, gray), 0.4) * 0.8 + float3(0.05, 0.04, 0.03);
-        float2 k = frac(i.uv * float2(260.0, 175.0));
-        float knot = smoothstep(0.0, 0.18, min(min(k.x, 1.0 - k.x), min(k.y, 1.0 - k.y)));
-        col *= lerp(0.86, 1.0, knot);
-    }
-
-    float2 e2 = min(i.uv, 1.0 - i.uv) * rugSize;
-    float e = min(e2.x, e2.y);
-    col *= lerp(0.62, 1.0, smoothstep(0.4, 3.0, e));
-
-    float3 L = normalize(lightDir.xyz);
-    float amb = 0.28, kd = 0.95;
-    float shade = (amb + kd * max(dot(Nd, L), 0.0)) / (amb + kd * L.z);
-
-    float2 gp = float2(0.0, 0.0);
-    float bias = 1.5;
-    if (abs(Ng.z) > 0.2)
-    {
-        float2 gg = -Ng.xy / Ng.z;
-        float den = 1.0 - dot(gg, lightK);
-        if (abs(den) > 0.25) gp = clamp(gg / den, -3.0, 3.0);
-        else bias = 5.0;
-    }
-    else
-    {
-        bias = 5.0;
-    }
-    float sh = shadowAt(i.world, gp, bias, sp.xy);
-    shade *= 1.0 - 0.55 * sh;
-
-    return float4(min(col * min(shade, 1.3), 1.0), 1.0);
-}
-)HLSL";
 
 struct State {
     int w = 0, h = 0;
@@ -237,6 +101,18 @@ struct State {
     float liftFrom = 0.0f, liftTo = 0.0f;
     float rampT = 0.0f;
     float accum = 0.0f;
+
+    // The cloth is asleep: the last Cloth::step was a bit-exact no-op, or its mean pose moved less than
+    // kSleepDrift between the last two kSleepWindow-step windows. Nothing has touched the cloth or the ground since.
+    bool settled = false;
+    bool derivedStale = false;
+    bool frameDirty = true;
+    std::vector<V3> snapPos, snapPrev, snapVel;
+    int windowSteps = 0;
+    int awakeWindows = 0;
+    bool havePrevMean = false;
+    // Positions are summed relative to the window's first pose, so float sums of ~1000 px values keep their precision.
+    std::vector<V3> windowStart, windowSum, prevMean;
 };
 
 State S;
@@ -247,6 +123,37 @@ void Release(T*& ptr) {
 }
 
 V2 ToV2(float x, float y) { return { x, y }; }
+
+// Every export that changes the cloth, its invMass or the picture calls this.
+void Touch() {
+    S.settled = false;
+    S.windowSteps = 0;
+    S.awakeWindows = 0;
+    S.havePrevMean = false;
+    S.frameDirty = true;
+}
+
+template <class T>
+bool SameBits(const std::vector<T>& a, const std::vector<T>& b) {
+    return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * sizeof(T)) == 0;
+}
+
+// Turns the window's sums into its mean pose, stores it in prevMean and returns whether it is within distance of
+// the previous window's mean.
+bool MeanStayedWithin(float distance) {
+    const float limit = distance * distance;
+    const float inv = 1.0f / float(kSleepWindow);
+    const bool compare = S.havePrevMean && S.prevMean.size() == S.windowStart.size();
+    S.prevMean.resize(S.windowStart.size());
+    bool within = compare;
+    for (size_t i = 0; i < S.windowStart.size(); ++i) {
+        const V3 mean = S.windowStart[i] + S.windowSum[i] * inv;
+        if (compare && !(len2(mean - S.prevMean[i]) < limit)) within = false;
+        S.prevMean[i] = mean;
+    }
+    S.havePrevMean = true;
+    return within;
+}
 
 }
 
@@ -286,6 +193,7 @@ extern "C" void rug_shutdown(void) {
     S.verts.clear();
     S.ibCount = 0;
     S.dragging = false;
+    Touch();
 }
 
 extern "C" int rug_init(int w, int h) {
@@ -326,42 +234,19 @@ extern "C" int rug_init(int w, int h) {
     sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
     if (FAILED(S.dev->CreateTexture2D(&sd, nullptr, &S.staging))) return 0;
 
-    auto compile = [](const char* entry, const char* target) -> ID3DBlob* {
-        ID3DBlob* blob = nullptr;
-        ID3DBlob* err = nullptr;
-        HRESULT hr = D3DCompile(kShader, std::strlen(kShader), nullptr, nullptr, nullptr,
-                                entry, target, 0, 0, &blob, &err);
-        if (FAILED(hr) && err) std::fprintf(stderr, "shader %s: %s\n", entry, static_cast<const char*>(err->GetBufferPointer()));
-        if (err) err->Release();
-        return SUCCEEDED(hr) ? blob : nullptr;
-    };
-    ID3DBlob* vsBlob = compile("VSMain", "vs_5_0");
-    ID3DBlob* psBlob = compile("PSMain", "ps_5_0");
-    ID3DBlob* shVsBlob = compile("ShadowVS", "vs_5_0");
-    ID3DBlob* shPsBlob = compile("ShadowPS", "ps_5_0");
-    ID3DBlob* flVsBlob = compile("FloorVS", "vs_5_0");
-    ID3DBlob* flPsBlob = compile("FloorPS", "ps_5_0");
-    if (!vsBlob || !psBlob || !shVsBlob || !shPsBlob || !flVsBlob || !flPsBlob) return 0;
-
-    S.dev->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr, &S.vs);
-    S.dev->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, &S.ps);
-    S.dev->CreateVertexShader(shVsBlob->GetBufferPointer(), shVsBlob->GetBufferSize(), nullptr, &S.shadowVs);
-    S.dev->CreatePixelShader(shPsBlob->GetBufferPointer(), shPsBlob->GetBufferSize(), nullptr, &S.shadowPs);
-    S.dev->CreateVertexShader(flVsBlob->GetBufferPointer(), flVsBlob->GetBufferSize(), nullptr, &S.floorVs);
-    S.dev->CreatePixelShader(flPsBlob->GetBufferPointer(), flPsBlob->GetBufferSize(), nullptr, &S.floorPs);
+    if (FAILED(S.dev->CreateVertexShader(g_cloth_vs, sizeof(g_cloth_vs), nullptr, &S.vs))) return 0;
+    if (FAILED(S.dev->CreatePixelShader(g_cloth_ps, sizeof(g_cloth_ps), nullptr, &S.ps))) return 0;
+    if (FAILED(S.dev->CreateVertexShader(g_shadow_vs, sizeof(g_shadow_vs), nullptr, &S.shadowVs))) return 0;
+    if (FAILED(S.dev->CreatePixelShader(g_shadow_ps, sizeof(g_shadow_ps), nullptr, &S.shadowPs))) return 0;
+    if (FAILED(S.dev->CreateVertexShader(g_floor_vs, sizeof(g_floor_vs), nullptr, &S.floorVs))) return 0;
+    if (FAILED(S.dev->CreatePixelShader(g_floor_ps, sizeof(g_floor_ps), nullptr, &S.floorPs))) return 0;
 
     D3D11_INPUT_ELEMENT_DESC layoutDesc[] = {
         { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0,  0, D3D11_INPUT_PER_VERTEX_DATA, 0 },
         { "NORMAL",   0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0 },
         { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT,    0, 24, D3D11_INPUT_PER_VERTEX_DATA, 0 },
     };
-    S.dev->CreateInputLayout(layoutDesc, 3, vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), &S.layout);
-    vsBlob->Release();
-    psBlob->Release();
-    shVsBlob->Release();
-    shPsBlob->Release();
-    flVsBlob->Release();
-    flPsBlob->Release();
+    if (FAILED(S.dev->CreateInputLayout(layoutDesc, 3, g_cloth_vs, sizeof(g_cloth_vs), &S.layout))) return 0;
 
     D3D11_TEXTURE2D_DESC shd{};
     shd.Width = w;
@@ -455,11 +340,13 @@ extern "C" int rug_load_texture(const wchar_t* path) {
 
         UINT w = 0, h = 0;
         converter->GetSize(&w, &h);
-        std::vector<unsigned char> px(size_t(w) * h * 4);
+        // A larger picture cannot become a Direct3D 11 texture, so it is refused before its pixels are allocated.
+        if (w == 0 || h == 0 || w > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION || h > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION) break;
+        std::vector<unsigned char> px;
+        try { px.resize(size_t(w) * h * 4); }
+        catch (const std::bad_alloc&) { break; }
         if (FAILED(converter->CopyPixels(nullptr, w * 4, UINT(px.size()), px.data()))) break;
 
-        Release(S.rugSrv);
-        Release(S.rugTex);
         D3D11_TEXTURE2D_DESC td{};
         td.Width = w;
         td.Height = h;
@@ -472,10 +359,18 @@ extern "C" int rug_load_texture(const wchar_t* path) {
         D3D11_SUBRESOURCE_DATA init{};
         init.pSysMem = px.data();
         init.SysMemPitch = w * 4;
-        if (FAILED(S.dev->CreateTexture2D(&td, &init, &S.rugTex))) break;
-        if (FAILED(S.dev->CreateShaderResourceView(S.rugTex, nullptr, &S.rugSrv))) break;
+        // The current rug stays on screen unless the new picture fully loads.
+        ID3D11Texture2D* tex = nullptr;
+        ID3D11ShaderResourceView* srv = nullptr;
+        if (FAILED(S.dev->CreateTexture2D(&td, &init, &tex))) break;
+        if (FAILED(S.dev->CreateShaderResourceView(tex, nullptr, &srv))) { tex->Release(); break; }
+        Release(S.rugSrv);
+        Release(S.rugTex);
+        S.rugTex = tex;
+        S.rugSrv = srv;
         S.texW = int(w);
         S.texH = int(h);
+        Touch();
         ok = 1;
     } while (false);
 
@@ -499,6 +394,8 @@ extern "C" void rug_rebuild(float scale, float drop) {
     S.cloth->layout(S.camera.center(), 0.0f, drop * unitScale());
     S.cloth->updateDerived(S.camera);
     S.dragging = false;
+    S.derivedStale = false;
+    Touch();
 
     Release(S.vb);
     Release(S.ib);
@@ -521,6 +418,7 @@ extern "C" void rug_rebuild(float scale, float drop) {
 }
 
 extern "C" void rug_set_bumps(const float* data, int count) {
+    if (!data || count < 0) count = 0;
     std::vector<Bump> bumps;
     bumps.reserve(count);
     for (int i = 0; i < count; ++i) {
@@ -528,6 +426,62 @@ extern "C" void rug_set_bumps(const float* data, int count) {
         bumps.push_back({ { b[0], b[1] }, { b[2], b[3] }, b[4] * unitScale() });
     }
     if (S.field) S.field->setBumps(bumps);
+    S.settled = false;
+    S.windowSteps = 0;
+    S.havePrevMean = false;
+    // Without this a cloth that has already drifted for kStuckWindows windows would freeze about one window
+    // after the icons move, mid-fall onto the new bumps, instead of draping over them.
+    S.awakeWindows = 0;
+}
+
+// Runs one Cloth::step and decides whether the cloth may sleep. RUG_EXACT_STEPS keeps only the bit-exact
+// rule, so a test can compare every frame with the original code.
+static void StepCloth(float dt) {
+    Cloth& c = *S.cloth;
+    const float speedBefore = c.maxSpeed;
+    S.snapPos = c.pos;
+    S.snapPrev = c.prev;
+    S.snapVel = c.vel;
+    c.step(dt);
+    const bool posSame = SameBits(S.snapPos, c.pos);
+    const bool unchanged = posSame && SameBits(S.snapPrev, c.prev) && SameBits(S.snapVel, c.vel) &&
+                           std::memcmp(&speedBefore, &c.maxSpeed, sizeof(float)) == 0;
+    // A held cloth is a bit-exact no-op every step (every invMass is 0), so it would otherwise count as settled
+    // and the overlay would save the flat lifted sheet as the drape. Keep it awake while held.
+    const bool free = !S.dragging && !c.isGrabbing() && !S.held;
+    S.settled = unchanged && free;
+    if (!posSame) S.derivedStale = true;
+
+#ifndef RUG_EXACT_STEPS
+    if (S.settled || !free) {
+        S.windowSteps = 0;
+        S.awakeWindows = 0;
+        S.havePrevMean = false;
+        return;
+    }
+    if (S.windowSteps == 0) {
+        S.windowStart = c.pos;
+        S.windowSum.assign(c.pos.size(), V3{});
+    }
+    for (size_t i = 0; i < c.pos.size(); ++i) S.windowSum[i] += c.pos[i] - S.windowStart[i];
+    if (++S.windowSteps == kSleepWindow) {
+        S.windowSteps = 0;
+        if (MeanStayedWithin(kSleepDrift)) {
+            S.settled = true;
+            S.awakeWindows = 0;
+        } else if (++S.awakeWindows >= kStuckWindows) {
+            // Never reached a fixed point: freeze every vertex at the latest window mean so the tremble stops.
+            for (size_t i = 0; i < c.pos.size(); ++i) {
+                c.pos[i] = S.prevMean[i];
+                c.prev[i] = S.prevMean[i];
+                c.vel[i] = V3{};
+            }
+            S.settled = true;
+            S.awakeWindows = 0;
+            S.derivedStale = true;
+        }
+    }
+#endif
 }
 
 extern "C" void rug_step(float dt) {
@@ -548,17 +502,26 @@ extern "C" void rug_step(float dt) {
             g.z = S.liftFrom + (S.liftTo - S.liftFrom) * (S.rampT / kLiftRamp);
             S.cloth->grabTarget = g;
         }
-        if (S.field) S.field->animate(fixed);
-        S.cloth->step(fixed);
+        const bool groundMoved = S.field && S.field->animate(fixed);
+        if (groundMoved || !S.settled || S.dragging || S.cloth->isGrabbing())
+            StepCloth(fixed);
         S.accum -= fixed;
         ++steps;
     }
     if (steps == 4) S.accum = 0.0f;
     if (steps > 0 && S.dragging) S.dragFrom = S.dragTo;
 
-    if (S.held && !S.cloth->pos.empty() && std::fabs(S.cloth->pos[0].z - liftH()) > 0.5f)
+    if (S.held && !S.cloth->pos.empty() && std::fabs(S.cloth->pos[0].z - liftH()) > 0.5f) {
         S.cloth->setHeld(true, liftH());
-    if (steps > 0) S.cloth->updateDerived(S.camera);
+        S.settled = false;
+        S.derivedStale = true;
+    }
+    // updateDerived depends only on pos, so it is skipped while pos is bit-identical to its last input.
+    if (steps > 0 && S.derivedStale) {
+        S.cloth->updateDerived(S.camera);
+        S.derivedStale = false;
+        S.frameDirty = true;
+    }
 }
 
 static void activeRect(int out[4]) {
@@ -574,8 +537,11 @@ static void activeRect(int out[4]) {
     out[0] = left; out[1] = top; out[2] = std::max(0, right - left); out[3] = std::max(0, bottom - top);
 }
 
-extern "C" void rug_render(unsigned char* dst, int stride, int* rect) {
-    if (!S.ctx || !dst) return;
+extern "C" int rug_render(unsigned char* dst, int stride, int* rect) {
+    if (!S.ctx || !dst) return 0;
+    // Nothing that feeds the picture changed since the last call, so dst already holds this frame.
+    if (!S.frameDirty) return 0;
+    S.frameDirty = false;
 
     static int prevRc[4] = { 0, 0, 0, 0 };
     int rc[4] = { 0, 0, 0, 0 };
@@ -610,7 +576,9 @@ extern "C" void rug_render(unsigned char* dst, int stride, int* rect) {
         float lx = -0.5f, ly = 0.58f, lz = 0.64f;
         float l = std::sqrt(lx * lx + ly * ly + lz * lz);
         cb.lightDir[0] = lx / l; cb.lightDir[1] = ly / l; cb.lightDir[2] = lz / l; cb.lightDir[3] = 0.0f;
-        float sx = -0.3f, sy = 0.38f, sz = 0.87f;
+        // The shadow-casting light sits lower than the shading light (smaller z), so even a gentle bump over an
+        // icon throws a soft shadow and reads as relief away from the rug's edge, not only at the silhouette.
+        float sx = -0.3f, sy = 0.38f, sz = 0.55f;
         float s = std::sqrt(sx * sx + sy * sy + sz * sz);
         cb.lightK[0] = (sx / s) / (sz / s);
         cb.lightK[1] = (sy / s) / (sz / s);
@@ -693,8 +661,12 @@ extern "C" void rug_render(unsigned char* dst, int stride, int* rect) {
                             src + size_t(y) * m.RowPitch + size_t(drawRc[0]) * 4,
                             size_t(drawRc[2]) * 4);
             S.ctx->Unmap(S.staging, 0);
+        } else {
+            S.frameDirty = true;
+            return 0;
         }
     }
+    return 1;
 }
 
 extern "C" int rug_mouse_down(float x, float y) {
@@ -714,6 +686,7 @@ extern "C" int rug_mouse_down(float x, float y) {
     S.rampT = 0.0f;
     S.cloth->beginGrab(vertex, target);
     S.dragFrom = S.dragTo = target;
+    Touch();
     return 1;
 }
 
@@ -729,6 +702,7 @@ extern "C" void rug_mouse_up(void) {
     if (!S.cloth || !S.dragging) return;
     S.dragging = false;
     S.cloth->endGrab();
+    Touch();
 }
 
 extern "C" int rug_hit_test(float x, float y) {
@@ -746,6 +720,8 @@ extern "C" void rug_rotate(float angle) {
     if (!S.cloth) return;
     S.cloth->rotate(angle);
     S.cloth->updateDerived(S.camera);
+    S.derivedStale = false;
+    Touch();
 }
 
 extern "C" void rug_get_pose(float* out) {
@@ -767,6 +743,51 @@ extern "C" void rug_get_corners(float* out) {
     }
 }
 
+extern "C" int rug_point_count(void) {
+    return S.cloth ? S.cloth->count : 0;
+}
+
+extern "C" int rug_get_points(float* out, int maxVertices) {
+    if (!S.cloth || !out) return 0;
+    const int n = S.cloth->count;
+    if (maxVertices < n) return 0;
+    for (int i = 0; i < n; ++i) {
+        out[i * 3 + 0] = S.cloth->pos[i].x;
+        out[i * 3 + 1] = S.cloth->pos[i].y;
+        out[i * 3 + 2] = S.cloth->pos[i].z;
+    }
+    return n;
+}
+
+extern "C" int rug_set_points(const float* in, int count) {
+    if (!S.cloth || !in || count != S.cloth->count) return 0;
+    // A damaged drape must not poison the cloth: step()'s non-finite guard reads maxSpeed via std::max, which
+    // drops a NaN, so a NaN here would spread and never be caught. Reject the whole restore instead.
+    for (int i = 0; i < count * 3; ++i)
+        if (!std::isfinite(in[i])) return 0;
+    for (int i = 0; i < count; ++i) {
+        const V3 p{ in[i * 3 + 0], in[i * 3 + 1], in[i * 3 + 2] };
+        S.cloth->pos[i] = p;
+        S.cloth->prev[i] = p;   // prev == pos leaves the cloth at rest, so it holds the saved folds
+        S.cloth->vel[i] = {};
+        S.cloth->invMass[i] = 1.0f;
+    }
+    // The caller sets the bumps just before restoring, but the height field rises to them over about 1.5 s. Snap
+    // it to the bumps now so the restored folds rest on them instead of slumping onto flat ground first.
+    if (S.field) S.field->snap();
+    S.cloth->endGrab();
+    S.dragging = false;
+    S.held = false;
+    S.cloth->updateDerived(S.camera);
+    S.derivedStale = false;
+    Touch();
+    return 1;
+}
+
+extern "C" int rug_is_settled(void) {
+    return S.settled ? 1 : 0;
+}
+
 extern "C" void rug_resize(float scale) {
     if (!S.cloth) return;
     V2 pc{};
@@ -778,25 +799,27 @@ extern "C" void rug_resize(float scale) {
     S.cloth->layout(pc, pa, 0.0f);
     if (wasHeld) S.cloth->setHeld(true, liftH());
     S.cloth->updateDerived(S.camera);
+    S.derivedStale = false;
+    Touch();
 }
 
 extern "C" void rug_hold_begin(void) {
     if (!S.cloth) return;
     S.dragging = false;
-    S.cloth->layout(S.camera.center(), 0.0f, 60.0f * unitScale());
-    V2 pc{};
-    float pa = 0.0f;
-    S.cloth->pose(pc, pa);
-    S.cloth->layout(S.camera.center(), pa, 60.0f * unitScale());
+    // Lift the cloth straight up where it already sits, keeping its centre and angle. The old path re-laid it out
+    // at the screen centre first, so pressing Alt to resize snapped the rug back to a fresh centred drop.
     S.held = true;
     S.cloth->setHeld(true, liftH());
     S.cloth->updateDerived(S.camera);
+    S.derivedStale = false;
+    Touch();
 }
 
 extern "C" void rug_hold_end(void) {
     if (!S.cloth) return;
     S.held = false;
     S.cloth->setHeld(false, 0.0f);
+    Touch();
 }
 
 extern "C" void rug_layout(float cx, float cy, float angle, float drop) {
@@ -804,4 +827,10 @@ extern "C" void rug_layout(float cx, float cy, float angle, float drop) {
     S.dragging = false;
     S.cloth->layout(V2{ cx, cy }, angle, drop * unitScale());
     S.cloth->updateDerived(S.camera);
+    S.derivedStale = false;
+    Touch();
+}
+
+extern "C" void rug_invalidate(void) {
+    S.frameDirty = true;
 }

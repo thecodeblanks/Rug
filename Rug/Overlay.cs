@@ -27,6 +27,8 @@ internal static class Overlay
     private const uint SWP_NOACTIVATE = 0x0010;
     private const int SW_SHOWNOACTIVATE = 4;
     private const uint ULW_ALPHA = 0x00000002;
+    private const uint GW_HWNDNEXT = 2;
+    private const uint GW_HWNDPREV = 3;
     private const uint PM_REMOVE = 0x0001;
     private const byte AC_SRC_OVER = 0x00;
     private const byte AC_SRC_ALPHA = 0x01;
@@ -35,11 +37,18 @@ internal static class Overlay
     private const int VK_RMENU = 0xA5;
 
     private const uint WM_MOUSEWHEEL = 0x020A;
+    private const uint WM_DISPLAYCHANGE = 0x007E;
     private const double IconRefreshMs = 2000;
     private const float DefaultDrop = 90f;
     private const float MenuDrop = 110f;
     private const float CenterDrop = 60f;
     private const int FrameMs = 16;
+
+    // Display settings for EnumDisplaySettings and the high-resolution waitable timer the awake loop waits on.
+    private const int ENUM_CURRENT_SETTINGS = -1;
+    private const uint CREATE_WAITABLE_TIMER_HIGH_RESOLUTION = 0x2;
+    private const uint TIMER_ALL_ACCESS = 0x1F0003;
+    private static volatile int _refreshHz = 60;
 
     private static readonly ConcurrentQueue<Action> _commands = new();
     private static readonly ManualResetEventSlim _ready = new(false);
@@ -50,6 +59,7 @@ internal static class Overlay
     private static IntPtr _host;
     private static float _rugScale = 0.46f;
     private static float[] _lastBumps = Array.Empty<float>();
+    private static float[] _sentBumps = Array.Empty<float>();
 
     public static Action<string>? Notifier;
 
@@ -60,7 +70,8 @@ internal static class Overlay
     [DllImport("rug_native.dll", CallingConvention = CallingConvention.Cdecl)] private static extern void rug_rebuild(float scale, float drop);
     [DllImport("rug_native.dll", CallingConvention = CallingConvention.Cdecl)] private static extern void rug_set_bumps(float[] data, int count);
     [DllImport("rug_native.dll", CallingConvention = CallingConvention.Cdecl)] private static extern void rug_step(float dt);
-    [DllImport("rug_native.dll", CallingConvention = CallingConvention.Cdecl)] private static extern void rug_render(IntPtr dst, int stride, int[] rect);
+    [DllImport("rug_native.dll", CallingConvention = CallingConvention.Cdecl)] private static extern int rug_render(IntPtr dst, int stride, int[] rect);
+    [DllImport("rug_native.dll", CallingConvention = CallingConvention.Cdecl)] private static extern void rug_invalidate();
     [DllImport("rug_native.dll", CallingConvention = CallingConvention.Cdecl)] private static extern int rug_mouse_down(float x, float y);
     [DllImport("rug_native.dll", CallingConvention = CallingConvention.Cdecl)] private static extern void rug_mouse_drag(float x, float y);
     [DllImport("rug_native.dll", CallingConvention = CallingConvention.Cdecl)] private static extern void rug_mouse_up();
@@ -73,6 +84,10 @@ internal static class Overlay
     [DllImport("rug_native.dll", CallingConvention = CallingConvention.Cdecl)] private static extern void rug_hold_end();
     [DllImport("rug_native.dll", CallingConvention = CallingConvention.Cdecl)] private static extern void rug_get_bounds(float[] bounds);
     [DllImport("rug_native.dll", CallingConvention = CallingConvention.Cdecl)] private static extern void rug_layout(float cx, float cy, float angle, float drop);
+    [DllImport("rug_native.dll", CallingConvention = CallingConvention.Cdecl)] private static extern int rug_point_count();
+    [DllImport("rug_native.dll", CallingConvention = CallingConvention.Cdecl)] private static extern int rug_get_points(float[] points, int maxVertices);
+    [DllImport("rug_native.dll", CallingConvention = CallingConvention.Cdecl)] private static extern int rug_set_points(float[] points, int count);
+    [DllImport("rug_native.dll", CallingConvention = CallingConvention.Cdecl)] private static extern int rug_is_settled();
     [DllImport("rug_native.dll", CallingConvention = CallingConvention.Cdecl)] private static extern void rug_shutdown();
 
     private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
@@ -102,9 +117,8 @@ internal static class Overlay
     [DllImport("user32.dll")] private static extern short GetAsyncKeyState(int vKey);
     [DllImport("user32.dll")] private static extern IntPtr GetDC(IntPtr hWnd);
     [DllImport("user32.dll")] private static extern int ReleaseDC(IntPtr hWnd, IntPtr hdc);
-    [DllImport("user32.dll")] private static extern bool UpdateLayeredWindow(IntPtr hwnd, IntPtr hdcDst, ref POINT pptDst, ref SIZE psize,
-                                                                             IntPtr hdcSrc, ref POINT pptSrc, uint crKey,
-                                                                             ref BLENDFUNCTION pblend, uint dwFlags);
+    [DllImport("user32.dll")] private static extern bool UpdateLayeredWindowIndirect(IntPtr hwnd, ref UPDATELAYEREDWINDOWINFO info);
+    [DllImport("user32.dll")] private static extern IntPtr GetWindow(IntPtr hWnd, uint cmd);
     [DllImport("user32.dll")] private static extern bool PeekMessage(out MSG msg, IntPtr hWnd, uint filterMin, uint filterMax, uint remove);
     [DllImport("user32.dll")] private static extern bool TranslateMessage(ref MSG msg);
     [DllImport("user32.dll")] private static extern IntPtr DispatchMessage(ref MSG msg);
@@ -114,6 +128,11 @@ internal static class Overlay
     [DllImport("gdi32.dll")] private static extern bool DeleteObject(IntPtr obj);
     [DllImport("gdi32.dll")] private static extern IntPtr CreateDIBSection(IntPtr hdc, ref BITMAPINFO bmi, uint usage, out IntPtr bits, IntPtr section, uint offset);
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] private static extern IntPtr GetModuleHandle(string? moduleName);
+    [DllImport("kernel32.dll", SetLastError = true)] private static extern IntPtr CreateWaitableTimerExW(IntPtr attributes, string? name, uint flags, uint access);
+    [DllImport("kernel32.dll", SetLastError = true)] private static extern bool SetWaitableTimer(IntPtr timer, ref long dueTime, int period, IntPtr callback, IntPtr arg, bool resume);
+    [DllImport("kernel32.dll")] private static extern uint WaitForSingleObject(IntPtr handle, uint ms);
+    [DllImport("kernel32.dll")] private static extern bool CloseHandle(IntPtr handle);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern bool EnumDisplaySettingsW(string? deviceName, int mode, ref DEVMODE devMode);
 
     [StructLayout(LayoutKind.Sequential)] private struct POINT { public int x, y; }
     [StructLayout(LayoutKind.Sequential)] private struct SIZE { public int cx, cy; }
@@ -126,6 +145,16 @@ internal static class Overlay
     {
         public byte BlendOp, BlendFlags, SourceConstantAlpha, AlphaFormat;
     }
+    [StructLayout(LayoutKind.Sequential)] private struct RECT { public int left, top, right, bottom; }
+    [StructLayout(LayoutKind.Sequential)] private struct UPDATELAYEREDWINDOWINFO
+    {
+        public int cbSize;
+        public IntPtr hdcDst, pptDst, psize, hdcSrc, pptSrc;
+        public uint crKey;
+        public IntPtr pblend;
+        public uint dwFlags;
+        public IntPtr prcDirty;
+    }
     [StructLayout(LayoutKind.Sequential)] private struct BITMAPINFOHEADER
     {
         public int biSize, biWidth, biHeight;
@@ -133,6 +162,21 @@ internal static class Overlay
         public int biCompression, biSizeImage, biXPelsPerMeter, biYPelsPerMeter, biClrUsed, biClrImportant;
     }
     [StructLayout(LayoutKind.Sequential)] private struct BITMAPINFO { public BITMAPINFOHEADER bmiHeader; }
+    // The full DEVMODEW, so EnumDisplaySettings never writes past the struct; only dmDisplayFrequency is read.
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct DEVMODE
+    {
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmDeviceName;
+        public ushort dmSpecVersion, dmDriverVersion, dmSize, dmDriverExtra;
+        public uint dmFields;
+        public int dmPositionX, dmPositionY;
+        public uint dmDisplayOrientation, dmDisplayFixedOutput;
+        public short dmColor, dmDuplex, dmYResolution, dmTTOption, dmCollate;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmFormName;
+        public ushort dmLogPixels;
+        public uint dmBitsPerPel, dmPelsWidth, dmPelsHeight, dmDisplayFlags, dmDisplayFrequency;
+        public uint dmICMMethod, dmICMIntent, dmMediaType, dmDitherType, dmReserved1, dmReserved2, dmPanningWidth, dmPanningHeight;
+    }
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     private struct WNDCLASS
     {
@@ -277,6 +321,18 @@ internal static class Overlay
             _ready.Set();
             return;
         }
+        // Put back the exact drape from last time: rebuild at its saved scale, then (once the bumps are known)
+        // restore every vertex. A missing or mismatched file leaves the fresh centred drop below instead.
+        bool haveDrape = DrapeStore.TryLoad(out float drapeScale, out int drapeW, out int drapeH, out float[] drapePoints);
+        // The saved positions are screen pixels. On another screen size they would land off-screen, out of reach
+        // of the mouse, so drop a fresh rug instead.
+        if (haveDrape && (drapeW != _width || drapeH != _height))
+            haveDrape = false;
+        if (haveDrape)
+        {
+            _rugScale = Math.Clamp(drapeScale, 0.25f, 0.75f);
+            _currentScale = _rugScale;
+        }
         rug_rebuild(_rugScale, DefaultDrop);
 
         IntPtr instance = GetModuleHandle(null);
@@ -331,12 +387,37 @@ internal static class Overlay
             SourceConstantAlpha = 255,
             AlphaFormat = AC_SRC_ALPHA,
         };
+        IntPtr originPtr = Marshal.AllocHGlobal(Marshal.SizeOf<POINT>());
+        IntPtr sizePtr = Marshal.AllocHGlobal(Marshal.SizeOf<SIZE>());
+        IntPtr blendPtr = Marshal.AllocHGlobal(Marshal.SizeOf<BLENDFUNCTION>());
+        IntPtr dirtyPtr = Marshal.AllocHGlobal(Marshal.SizeOf<RECT>());
+        Marshal.StructureToPtr(origin, originPtr, false);
+        Marshal.StructureToPtr(size, sizePtr, false);
+        Marshal.StructureToPtr(blend, blendPtr, false);
+        var update = new UPDATELAYEREDWINDOWINFO
+        {
+            cbSize = Marshal.SizeOf<UPDATELAYEREDWINDOWINFO>(),
+            hdcDst = screenDc,
+            pptDst = originPtr,
+            psize = sizePtr,
+            hdcSrc = memDc,
+            pptSrc = originPtr,
+            pblend = blendPtr,
+            dwFlags = ULW_ALPHA,
+        };
+        bool presented = false;
+        bool handlesShown = false;
+
+        QueryRefresh();
+        // A high-resolution timer paces a moving rug to the display's refresh; IntPtr.Zero on Windows before 1803 falls
+        // back to a plain sleep. dueNext is the clock time (seconds) of the next frame boundary.
+        IntPtr frameTimer = CreateWaitableTimerExW(IntPtr.Zero, null, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        double dueNext = 0;
 
         var clock = Stopwatch.StartNew();
         double last = 0;
         bool clickable = false;
         bool wasDown = false;
-        bool wasAlt = false;
         bool rotating = false;
         int grabbedCorner = -1;
         float prevAngle = 0;
@@ -345,11 +426,22 @@ internal static class Overlay
         float[] corners = new float[8];
         float[] pose = new float[3];
         bool dragging = false;
+        IntPtr zAbove = IntPtr.Zero, zBelow = IntPtr.Zero;
         long lastIconScan = 0;
         Task<float[]>? scanTask = null;
+        bool wasSettled = false;
+        float[]? drapeBuf = null;
+        float[] lastScanRaw = Array.Empty<float>();
+        float[] appliedPose = new float[3];
+        float[] scanPose = new float[3];
 
         SetClickThrough(hwnd, true);
         ApplyBumps(DesktopIcons.Scan(_host, width, height));
+        // The drape was saved over these same icons, so restore it now that the ground is set. The count only
+        // differs when the rug picture (its aspect) changed since; then the fresh drop above stands.
+        int drapeCount = rug_point_count();
+        if (haveDrape && drapePoints.Length == drapeCount * 3)
+            rug_set_points(drapePoints, drapeCount);
         _ready.Set();
 
         while (_running)
@@ -374,15 +466,27 @@ internal static class Overlay
             bool down = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
             bool alt = AltDown();
 
-            if (alt && !wasAlt && !dragging)
-                rug_hold_begin();
-            else if (!alt && wasAlt)
-                rug_hold_end();
-            wasAlt = alt;
+            // Decide click-through before handling input, so overOverlay is current when the corner grab and the drag
+            // read it below. The rug is clickable when the cursor is over it, or over a corner handle while Alt is
+            // held. Re-read overOverlay the instant WS_EX_TRANSPARENT is dropped (verified same-thread immediate by
+            // tests/clickthrough-test): otherwise the first click after the cursor reaches the rug is lost, because
+            // overOverlay was taken at the top of the loop while the window was still click-through.
+            bool hit = rug_hit_test(px, py) != 0;
+            bool wantClick = hit || rotating || dragging || (alt && NearCorner(px, py, corners) >= 0);
+            if (wantClick != clickable)
+            {
+                clickable = wantClick;
+                SetClickThrough(hwnd, !wantClick);
+                if (wantClick) overOverlay = WindowFromPoint(cursor) == hwnd;
+            }
+
+            // Alt on its own only shows the corner handles; it must not disturb the rug. The rug is lifted when a
+            // manipulation actually starts (the corner grab below), so Alt+Tab or a stray Alt leaves it in place.
 
             if (alt && down && !wasDown && !dragging && overOverlay && NearCorner(px, py, corners) >= 0)
             {
                 rotating = true;
+                rug_hold_begin();
                 grabbedCorner = NearCorner(px, py, corners);
                 rug_get_pose(pose);
                 float sx = px - pose[0], sy = py - pose[1];
@@ -404,6 +508,7 @@ internal static class Overlay
                         _currentScale = _rugScale;
                         rug_resize(_rugScale);
                     }
+                    rug_hold_end();
                 }
                 else
                 {
@@ -442,14 +547,6 @@ internal static class Overlay
                 }
             }
 
-            bool hit = rug_hit_test(px, py) != 0;
-            bool wantClick = hit || rotating || dragging || (alt && NearCorner(px, py, corners) >= 0);
-            if (wantClick != clickable)
-            {
-                clickable = wantClick;
-                SetClickThrough(hwnd, !wantClick);
-            }
-
             if (!rotating)
             {
                 if (!dragging)
@@ -470,7 +567,15 @@ internal static class Overlay
             }
             wasDown = down;
 
-            SetWindowPos(hwnd, _host, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            // Windows keeps the shell's desktop window at the bottom, so where SetWindowPos leaves the overlay differs
+            // between versions: on Windows 11 26200 it stays above Progman, never below it. The overlay is put back
+            // only when a window next to it changed since it was last put back.
+            if (GetWindow(hwnd, GW_HWNDPREV) != zAbove || GetWindow(hwnd, GW_HWNDNEXT) != zBelow)
+            {
+                SetWindowPos(hwnd, _host, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                zAbove = GetWindow(hwnd, GW_HWNDPREV);
+                zBelow = GetWindow(hwnd, GW_HWNDNEXT);
+            }
 
             long nowMs = Environment.TickCount64;
             if (scanTask == null && !dragging && nowMs - lastIconScan > IconRefreshMs)
@@ -481,27 +586,103 @@ internal static class Overlay
             }
             if (scanTask != null && scanTask.IsCompleted)
             {
-                ApplyBumps(scanTask.Result);
+                float[] raw = scanTask.Result;
                 scanTask = null;
+                // Re-apply the bumps only when the icons actually moved, or the rug slid far enough to cover
+                // different ones. GroupPile reads the live pose through rug_hit_test, so re-running it on a
+                // sub-pixel tremble resends near-identical bumps and resets the sleep window every scan, which
+                // keeps the rug awake for good. A few pixels of real movement still re-groups the pile.
+                const float regroupMovePx = 4f;
+                const float regroupTurnRad = 0.02f;
+                rug_get_pose(scanPose);
+                bool iconsMoved = !MemoryMarshal.AsBytes(raw.AsSpan()).SequenceEqual(MemoryMarshal.AsBytes(lastScanRaw.AsSpan()));
+                float dx = scanPose[0] - appliedPose[0], dy = scanPose[1] - appliedPose[1];
+                bool rugMoved = dx * dx + dy * dy > regroupMovePx * regroupMovePx
+                    || MathF.Abs(scanPose[2] - appliedPose[2]) > regroupTurnRad;
+                if (iconsMoved || rugMoved)
+                {
+                    ApplyBumps(raw);
+                    lastScanRaw = raw;
+                    appliedPose[0] = scanPose[0];
+                    appliedPose[1] = scanPose[1];
+                    appliedPose[2] = scanPose[2];
+                }
             }
 
             double now = clock.Elapsed.TotalSeconds;
             rug_step((float)(now - last));
             last = now;
 
-            rug_render(bits, width * 4, activeRect);
+            // Save the drape each time the rug comes to rest, so a restart puts the exact folds back. This fires
+            // only on the settle edge, so a sleeping rug writes nothing and a drag writes once when it stops.
+            bool settledNow = rug_is_settled() != 0;
+            if (settledNow && !wasSettled)
+            {
+                int n = rug_point_count();
+                if (n > 0)
+                {
+                    if (drapeBuf == null || drapeBuf.Length < n * 3) drapeBuf = new float[n * 3];
+                    if (rug_get_points(drapeBuf, n) == n) DrapeStore.Save(_currentScale, _width, _height, drapeBuf, n);
+                }
+            }
+            wasSettled = settledNow;
+
+            // The handles sit inside the rug's area, so a redraw of that area erases them.
+            if (!alt && handlesShown)
+            {
+                rug_invalidate();
+                handlesShown = false;
+            }
+            var dirty = new RECT();
+            if (rug_render(bits, width * 4, activeRect) != 0)
+                dirty = new RECT { left = activeRect[0], top = activeRect[1], right = activeRect[0] + activeRect[2], bottom = activeRect[1] + activeRect[3] };
+            bool drawn = dirty.right > dirty.left && dirty.bottom > dirty.top;
             if (alt)
             {
                 rug_get_corners(corners);
-                DrawCornerHandles(bits, width, height, corners);
+                if (drawn || !handlesShown)
+                {
+                    dirty = Union(dirty, DrawCornerHandles(bits, width, height, corners));
+                    handlesShown = true;
+                }
             }
 
-            UpdateLayeredWindow(hwnd, screenDc, ref origin, ref size, memDc, ref origin, 0, ref blend, ULW_ALPHA);
+            // Only pixels inside the dirty rectangle changed since the last update, so only those go to the compositor.
+            if (!presented || (dirty.right > dirty.left && dirty.bottom > dirty.top))
+            {
+                Marshal.StructureToPtr(dirty, dirtyPtr, false);
+                update.prcDirty = presented ? dirtyPtr : IntPtr.Zero;
+                UpdateLayeredWindowIndirect(hwnd, ref update);
+                presented = true;
+            }
 
-            Thread.Sleep(FrameMs);
+            // A moving rug is paced to the display's refresh, so a drag looks as smooth as the monitor allows (60 Hz or
+            // 120 Hz) instead of the 32 fps a Thread.Sleep(16) gives at the default 15.6 ms timer. While the rug sleeps
+            // nothing is drawn, so a plain sleep keeps the idle wake-ups low and input latency unchanged.
+            if ((drawn || dragging || rotating) && frameTimer != IntPtr.Zero)
+            {
+                double frame = 1.0 / Math.Max(24, _refreshHz);
+                double now2 = clock.Elapsed.TotalSeconds;
+                // Resume from now after a sleep or an overrun, so the timer never tries to catch up a long gap.
+                dueNext = (dueNext <= now2 ? now2 : dueNext) + frame;
+                double waitSec = dueNext - clock.Elapsed.TotalSeconds;
+                if (waitSec > 0.0002)
+                {
+                    long due = -(long)(waitSec * 1e7); // 100 ns units, negative for a relative wait
+                    SetWaitableTimer(frameTimer, ref due, 0, IntPtr.Zero, IntPtr.Zero, false);
+                    WaitForSingleObject(frameTimer, FrameMs * 2);
+                }
+            }
+            else
+                Thread.Sleep(FrameMs);
         }
 
         rug_shutdown();
+        if (frameTimer != IntPtr.Zero) CloseHandle(frameTimer);
+        Marshal.FreeHGlobal(originPtr);
+        Marshal.FreeHGlobal(sizePtr);
+        Marshal.FreeHGlobal(blendPtr);
+        Marshal.FreeHGlobal(dirtyPtr);
         SelectObject(memDc, oldBitmap);
         DeleteObject(dib);
         DeleteDC(memDc);
@@ -512,10 +693,22 @@ internal static class Overlay
     private static bool AltDown() =>
         ((GetAsyncKeyState(VK_LMENU) | GetAsyncKeyState(VK_RMENU)) & 0x8000) != 0;
 
+    // The primary display's current refresh, so a moving rug is paced to it (60 Hz or 120 Hz). Left at 60 when the
+    // call fails or reports a rate too low to trust.
+    private static void QueryRefresh()
+    {
+        var mode = new DEVMODE { dmSize = (ushort)Marshal.SizeOf<DEVMODE>() };
+        if (EnumDisplaySettingsW(null, ENUM_CURRENT_SETTINGS, ref mode) && mode.dmDisplayFrequency >= 24)
+            _refreshHz = (int)mode.dmDisplayFrequency;
+    }
+
     private static void ApplyBumps(float[] bumps)
     {
         _lastBumps = bumps;
         if (IconPile.HasHome) bumps = GroupPile(bumps);
+        // The same bumps again would only restart the ground animation from where it already is.
+        if (MemoryMarshal.AsBytes(bumps.AsSpan()).SequenceEqual(MemoryMarshal.AsBytes(_sentBumps.AsSpan()))) return;
+        _sentBumps = bumps;
         rug_set_bumps(bumps, bumps.Length / 5);
     }
 
@@ -547,6 +740,11 @@ internal static class Overlay
 
     private static IntPtr OnWndProc(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam)
     {
+        if (msg == WM_DISPLAYCHANGE)
+        {
+            QueryRefresh();
+            return IntPtr.Zero;
+        }
         if (msg == WM_MOUSEWHEEL)
         {
             long v = wParam.ToInt64();
@@ -577,10 +775,12 @@ internal static class Overlay
         return -1;
     }
 
-    private static void DrawCornerHandles(IntPtr bits, int width, int height, float[] corners)
+    // Returns the area it painted, clipped to the screen.
+    private static RECT DrawCornerHandles(IntPtr bits, int width, int height, float[] corners)
     {
         const int radius = 7;
         const int blue = unchecked((int)0xFF007AFF);
+        var painted = new RECT();
         for (int i = 0; i < 4; i++)
         {
             int cx = (int)MathF.Round(corners[i * 2]);
@@ -592,7 +792,29 @@ internal static class Overlay
                     if (x < 0 || y < 0 || x >= width || y >= height) continue;
                     Marshal.WriteInt32(bits, (y * width + x) * 4, blue);
                 }
+            var box = new RECT
+            {
+                left = Math.Max(0, cx - radius),
+                top = Math.Max(0, cy - radius),
+                right = Math.Min(width, cx + radius + 1),
+                bottom = Math.Min(height, cy + radius + 1),
+            };
+            painted = Union(painted, box);
         }
+        return painted;
+    }
+
+    private static RECT Union(RECT a, RECT b)
+    {
+        if (a.right <= a.left || a.bottom <= a.top) return b;
+        if (b.right <= b.left || b.bottom <= b.top) return a;
+        return new RECT
+        {
+            left = Math.Min(a.left, b.left),
+            top = Math.Min(a.top, b.top),
+            right = Math.Max(a.right, b.right),
+            bottom = Math.Max(a.bottom, b.bottom),
+        };
     }
 
     private static void SetClickThrough(IntPtr hwnd, bool through)

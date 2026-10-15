@@ -71,6 +71,8 @@ internal sealed class TrayContext : ApplicationContext
 
     public void RestoreFloor() => Wallpaper.Restore(_settings);
 
+    public void Warn(string message) => _tray.ShowBalloonTip(4000, "Rug", message, ToolTipIcon.Warning);
+
     public void OwnImage()
     {
         using var dialog = new OpenFileDialog
