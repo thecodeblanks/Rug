@@ -65,11 +65,18 @@ bool HeightField::animate(float dt) {
     return true;
 }
 
+void HeightField::snap() {
+    data_ = target_;
+    animating_ = false;
+}
+
 float HeightField::sample(float x, float y) const {
     float fx = x / cell, fy = y / cell;
-    if (fx < 0 || fy < 0) return 0;
+    // Reject out of range as float, before the int cast: a huge finite coordinate (for example from a damaged
+    // restored drape) would overflow int(fx) to a negative index and slip past the bound checks, reading out of
+    // bounds. The !(fx >= 0) form also rejects a NaN that reached here.
+    if (!(fx >= 0) || !(fy >= 0) || fx >= float(w_ - 1) || fy >= float(h_ - 1)) return 0;
     int ix = int(fx), iy = int(fy);
-    if (ix >= w_ - 1 || iy >= h_ - 1) return 0;
     float tx = fx - ix, ty = fy - iy;
     size_t i = size_t(iy) * w_ + ix;
     float a = data_[i], b = data_[i + 1], c = data_[i + w_], d = data_[i + w_ + 1];
@@ -298,6 +305,14 @@ void Cloth::step(float frameDt) {
     hash_->create(pos, count);
     hash_->queryAll(pos, count, travel);
 
+    // rest[] is fixed for the whole step, so each pair's rest distance is computed once here instead of on every
+    // substep inside solveSelfCollisions (which runs 2 * substeps times).
+    int pairs = hash_->firstAdj[count];
+    if (int(selfRest2_.size()) < pairs) selfRest2_.resize(hash_->adj.size());
+    for (int i = 0; i < count; ++i)
+        for (int k = hash_->firstAdj[i]; k < hash_->firstAdj[i + 1]; ++k)
+            selfRest2_[k] = len2(rest[i] - rest[hash_->adj[k]]);
+
     for (int s = 0; s < n; ++s) {
         integrate(sdt, maxVel);
         moveGrabbed(sdt);
@@ -399,7 +414,7 @@ void Cloth::solveSelfCollisions() {
             V3 d = pos[j] - pos[i];
             float dist2 = len2(d);
             if (dist2 > t2 || dist2 == 0) continue;
-            float restDist2 = len2(rest[i] - rest[j]);
+            float restDist2 = selfRest2_[k];
             if (dist2 > restDist2) continue;
             float minDist = t;
             if (restDist2 < t2) minDist = std::sqrt(restDist2);
